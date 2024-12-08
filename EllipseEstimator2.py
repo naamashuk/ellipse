@@ -13,15 +13,59 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import csv
 
+def normalize_params(params, x_max, y_max, a_max, b_max, theta_max):
+    """
+    Normalize ellipse parameters to the range [0, 1].
+    
+    Args:
+        params (numpy array): Parameters [x, y, a, b, theta]. Can be 1D (for a single sample) or 2D.
+        x_max, y_max: Maximum values for x and y.
+        a_max, b_max: Maximum values for a and b (ellipse radii).
+        theta_max: Maximum value for theta (typically pi).
+    
+    Returns:
+        Normalized parameters.
+    """
+    params = np.atleast_2d(params)  # Ensure params is 2D
+    x, y, a, b, theta = params.T
+    x_norm = x / x_max
+    y_norm = y / y_max
+    a_norm = a / a_max
+    b_norm = b / b_max
+    theta_norm = theta / theta_max
+    return np.stack([x_norm, y_norm, a_norm, b_norm, theta_norm], axis=1)
+
+
+def denormalize_params(params_norm, x_max, y_max, a_max, b_max, theta_max):
+    """
+    Denormalize parameters from the range [0, 1] back to their original scale.
+
+    Args:
+        params_norm (numpy array): Normalized parameters [x, y, a, b, theta].
+        x_max, y_max: Maximum values for x and y.
+        a_max, b_max: Maximum values for a and b (ellipse radii).
+        theta_max: Maximum value for theta (typically pi).
+
+    Returns:
+        Denormalized parameters.
+    """
+    x_norm, y_norm, a_norm, b_norm, theta_norm = params_norm.T
+    x = x_norm * x_max
+    y = y_norm * y_max
+    a = a_norm * a_max
+    b = b_norm * b_max
+    theta = theta_norm * theta_max
+    return np.stack([x, y, a, b, theta], axis=1)
+
+
 # Dataset Definition
 class EllipseDataset(Dataset):
-    def __init__(self, image_dir, json_dir, image_list, transform=None, param_means=None, param_stds=None):
+    def __init__(self, image_dir, json_dir, image_list, transform=None, param_max=None):
         self.image_dir = image_dir
         self.json_dir = json_dir
         self.image_list = image_list
         self.transform = transform
-        self.param_means = param_means
-        self.param_stds = param_stds
+        self.param_max = param_max  # Dictionary with max values for normalization
 
     def __len__(self):
         return len(self.image_list)
@@ -34,7 +78,7 @@ class EllipseDataset(Dataset):
         # Load image
         image = Image.open(image_path).convert("RGB")
 
-        # Load label and regression parameters
+        # Load parameters
         with open(json_path, "r") as f:
             metadata = json.load(f)
 
@@ -43,18 +87,23 @@ class EllipseDataset(Dataset):
         radii = metadata["radLength"]
         theta = metadata["rotAngle"]
 
-        # Combine parameters
-        reg_params = [center[0], center[1], radii[0], radii[1], theta]
-
-        # Apply standardization
-        if label > 0.5 and self.param_means is not None and self.param_stds is not None:
-            reg_params = (np.array(reg_params) - self.param_means) / self.param_stds
+        # Combine and normalize parameters
+        reg_params = np.array([center[0], center[1], radii[0], radii[1], theta])
+        if label > 0.5:
+            reg_params = normalize_params(
+                reg_params,
+                x_max=self.param_max["x"],
+                y_max=self.param_max["y"],
+                a_max=self.param_max["a"],
+                b_max=self.param_max["b"],
+                theta_max=self.param_max["theta"]
+            ).flatten()  # Ensure 1D shape after normalization
 
         if self.transform:
             image = self.transform(image)
-        
+
         return image, torch.tensor(label, dtype=torch.float32), torch.tensor(reg_params, dtype=torch.float32)
-    
+
 
 def combined_loss(class_output, reg_output, labels, reg_labels, sampled_points, alpha=1.0, beta=1.0, gamma=0.5, delta=0.5):
     """
@@ -92,10 +141,11 @@ def combined_loss(class_output, reg_output, labels, reg_labels, sampled_points, 
         x_rot = (sampled_x - x.unsqueeze(-1)) * torch.cos(theta.unsqueeze(-1)) + (sampled_y - y.unsqueeze(-1)) * torch.sin(theta.unsqueeze(-1))
         y_rot = (sampled_y - y.unsqueeze(-1)) * torch.cos(theta.unsqueeze(-1)) - (sampled_x - x.unsqueeze(-1)) * torch.sin(theta.unsqueeze(-1))
         ellipse_eq = (x_rot / (a.unsqueeze(-1) + 1e-6))**2 + (y_rot / (b.unsqueeze(-1) + 1e-6))**2
-        penalty_shape = torch.abs(ellipse_eq - 1).mean()
+        penalty_shape = torch.abs(ellipse_eq - 1).mean() / sampled_points.size(1)  # Normalize by the number of points
 
     # Total loss
     total_loss = alpha * loss_cls + beta * loss_reg + gamma * penalty_geo + delta * penalty_shape
+
     return total_loss, loss_cls, loss_reg, penalty_geo, penalty_shape
 
 
@@ -155,33 +205,39 @@ class EllipseDetector(nn.Module):
         return class_out, reg_out
 
 
-def sample_ellipse_points(batch_size, num_points=100, device="cpu"):
+def sample_points_from_gt(gt_params, num_points=100):
     """
-    Generate sampled points on a unit circle and return them for regularization.
+    Sample points directly from the ground truth ellipse.
 
     Args:
-        batch_size: Number of ellipses to sample points for.
-        num_points: Number of points to sample per ellipse.
-        device: Device for computation (CPU or GPU).
+        gt_params (Tensor): Ground truth parameters [x0, y0, a, b, theta] (batch_size, 5).
+        num_points (int): Number of points to sample for each ellipse.
 
     Returns:
-        sampled_points: Tensor of shape (batch_size, num_points, 2).
+        sampled_points (Tensor): Sampled points on the GT ellipse (batch_size, num_points, 2).
     """
-    # Sample angles uniformly between 0 and 2*pi
-    angles = torch.linspace(0, 2 * torch.pi, num_points, device=device).unsqueeze(0).repeat(batch_size, 1)
+    batch_size = gt_params.size(0)
+    angles = torch.linspace(0, 2 * torch.pi, num_points, device=gt_params.device)  # (num_points)
+    angles = angles.unsqueeze(0).repeat(batch_size, 1)  # (batch_size, num_points)
 
-    # Points on the unit circle
-    x = torch.cos(angles)
-    y = torch.sin(angles)
+    # Extract GT parameters
+    x0, y0, a, b, theta = gt_params.T  # (batch_size)
 
-    # Combine as (x, y)
-    sampled_points = torch.stack((x, y), dim=-1)  # Shape: (batch_size, num_points, 2)
+    # Compute ellipse points
+    x = x0.unsqueeze(1) + a.unsqueeze(1) * torch.cos(angles) * torch.cos(theta).unsqueeze(1) - \
+        b.unsqueeze(1) * torch.sin(angles) * torch.sin(theta).unsqueeze(1)
+    y = y0.unsqueeze(1) + a.unsqueeze(1) * torch.cos(angles) * torch.sin(theta).unsqueeze(1) + \
+        b.unsqueeze(1) * torch.sin(angles) * torch.cos(theta).unsqueeze(1)
+
+    # Combine x and y into sampled points
+    sampled_points = torch.stack((x, y), dim=-1)  # (batch_size, num_points, 2)
     return sampled_points
+
 
 
 def train_model(
     model, train_loader, val_loader, optimizer, device, param_means, param_stds,
-    epochs=50, checkpoint_dir=None, log_file=None, alpha=1.0, beta=1.0, gamma=0.5, delta=0.5):
+    epochs=150, checkpoint_dir=None, log_file=None, alpha=1.0, beta=1.0, gamma=0.5, delta=0.5):
     
     os.makedirs(checkpoint_dir, exist_ok=True)
 
@@ -215,7 +271,7 @@ def train_model(
             images, labels, reg_labels = images.to(device), labels.to(device), reg_labels.to(device)
 
             # Generate sampled points for the batch
-            sampled_points = sample_ellipse_points(batch_size=len(images), num_points=100, device=device)
+            sampled_points = sample_points_from_gt(reg_labels, num_points=100)
 
             # Forward pass
             class_output, reg_output = model(images)
@@ -235,15 +291,22 @@ def train_model(
             train_loss_reg += loss_reg.item()
 
         # Validation
+        # Validation
         val_loss_cls, val_loss_reg, val_acc, ratios = evaluate_model(
             model, val_loader, nn.BCELoss(), nn.MSELoss(), device, param_means, param_stds
         )
 
+        # Calculate mean error across all parameters
+        mean_error = sum(ratios.values()) / len(ratios)
+
+        # Print metrics for the current epoch
         print(f"Epoch [{epoch+1}/{epochs}], Train Loss: {train_loss_total / len(train_loader):.4f}, "
-              f"Train Loss (Cls): {train_loss_cls / len(train_loader):.4f}, "
-              f"Train Loss (Reg): {train_loss_reg / len(train_loader):.4f}, "
-              f"Val Loss (Cls): {val_loss_cls:.4f}, Val Loss (Reg): {val_loss_reg:.4f}, Val Accuracy: {val_acc:.4f}")
-        print(f"Ratios (Val): x: {ratios['x']:.2f}, y: {ratios['y']:.2f}, a: {ratios['a']:.2f}, b: {ratios['b']:.2f}, theta: {ratios['theta']:.2f}")
+            f"Train Loss (Cls): {train_loss_cls / len(train_loader):.4f}, "
+            f"Train Loss (Reg): {train_loss_reg / len(train_loader):.4f}, "
+            f"Val Loss (Cls): {val_loss_cls:.4f}, Val Loss (Reg): {val_loss_reg:.4f}, "
+            f"Val Accuracy: {val_acc:.4f}, Mean Error: {mean_error:.4f}")
+        print(f"Ratios (Val): x: {ratios['x']:.4f}, y: {ratios['y']:.4f}, "
+            f"a: {ratios['a']:.4f}, b: {ratios['b']:.4f}, theta: {ratios['theta']:.4f}")
 
         # Save the last checkpoint
         torch.save({
@@ -260,18 +323,25 @@ def train_model(
             torch.save(model.state_dict(), best_model_path)
             print(f"Best model saved at epoch {epoch+1} with total val loss: {val_loss_total:.4f}")
 
-        # Log training metrics
+        # Export metrics to CSV
         if log_file:
             with open(log_file, mode="a", newline="") as f:
                 writer = csv.writer(f)
                 writer.writerow([
                     epoch + 1,
                     train_loss_total / len(train_loader),
+                    train_loss_cls / len(train_loader),
+                    train_loss_reg / len(train_loader),
                     val_loss_cls,
                     val_loss_reg,
-                    val_acc
+                    val_acc,
+                    mean_error,
+                    ratios['x'],
+                    ratios['y'],
+                    ratios['a'],
+                    ratios['b'],
+                    ratios['theta']
                 ])
-
 
 # Evaluation Function
 def evaluate_model(model, val_loader, criterion_cls, criterion_reg, device, param_means, param_stds):
@@ -282,7 +352,6 @@ def evaluate_model(model, val_loader, criterion_cls, criterion_reg, device, para
     total = 0
     ratios = {"x": 0.0, "y": 0.0, "a": 0.0, "b": 0.0, "theta": 0.0}
     count_ratios = 0
-
 
     with torch.no_grad():
         for images, labels, reg_labels in val_loader:
@@ -301,7 +370,7 @@ def evaluate_model(model, val_loader, criterion_cls, criterion_reg, device, para
                 reg_loss = criterion_reg(reg_output[mask], reg_labels[mask])
                 val_loss_reg += reg_loss.item()
 
-                # Reverse standardization
+                # Reverse normalization
                 pred_params = reg_output[mask].cpu().numpy()
                 gt_params = reg_labels[mask].cpu().numpy()
                 pred_params_orig = pred_params * param_stds + param_means
@@ -309,23 +378,20 @@ def evaluate_model(model, val_loader, criterion_cls, criterion_reg, device, para
 
                 # Compute ratios
                 for i, key in enumerate(["x", "y", "a", "b", "theta"]):
-                    ratios[key] += (abs(pred_params_orig[:, i] - gt_params_orig[:, i])/ (gt_params_orig[:, i] + 1e-6)).mean()
+                    ratios[key] += (abs(pred_params_orig[:, i] - gt_params_orig[:, i]) / 
+                                    (gt_params_orig[:, i] + 1e-6)).mean()
                 count_ratios += mask.sum().item()
 
             # Classification accuracy
             predictions = (class_output > 0.5).float()
-            predictions = predictions.squeeze(1)  # Shape becomes [32]
-            correct += (predictions == labels).sum().item()
+            correct += (predictions.squeeze(1) == labels).sum().item()
             total += labels.size(0)
 
     # Average ratios
     for key in ratios:
-       ratios[key] /= count_ratios
+        ratios[key] /= max(1, count_ratios)  # Avoid division by zero
 
-    return val_loss_cls / len(val_loader), val_loss_reg / count_ratios if count_ratios > 0 else 0.0, correct / total, ratios
-
-
-
+    return val_loss_cls / len(val_loader), val_loss_reg / max(1, count_ratios), correct / total, ratios
 
 # Plot Function
 def plot_training_log(log_file):
@@ -451,13 +517,46 @@ if __name__ == "__main__":
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])  # Example image normalization
     ])
 
+    # Define max values based on your data
+    param_max = {
+        "x": 400,  # Image width
+        "y": 400,  # Image height
+        "a": 283,  # Max semi-major axis
+        "b": 200,  # Max semi-minor axis
+        "theta": np.pi  # Theta max value
+    }
+
     # Create datasets
-    train_dataset = EllipseDataset(data_dir, json_dir, train_list, transform=transform, param_means=param_means, param_stds=param_stds)
-    val_dataset = EllipseDataset(data_dir, json_dir, val_list, transform=transform, param_means=param_means, param_stds=param_stds)
+    train_dataset = EllipseDataset(data_dir, json_dir, train_list, transform=transform, param_max=param_max)
+    val_dataset = EllipseDataset(data_dir, json_dir, val_list, transform=transform, param_max=param_max)
+
+    # Count positive and negative samples
+    # positive_count = 0
+    # negative_count = 0
+
+    # for _, label, _ in train_dataset:
+    #     if label == 1.0:
+    #         positive_count += 1
+    #     else:
+    #         negative_count += 1
+
+    # print(f"Number of positive samples (ellipse): {positive_count}")
+    # print(f"Number of negative samples (no ellipse): {negative_count}")
+
+    for idx in range(5):  # Test first 5 samples
+        image, label, reg_params = train_dataset[idx]
+        print(f"Sample {idx}: reg_params shape = {reg_params.shape}, label = {label}")
+
 
     # DataLoaders
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+
+    for images, labels, reg_labels in train_loader:
+        print(f"Images shape: {images.shape}")
+        print(f"Labels shape: {labels.shape}")
+        print(f"Regression labels shape: {reg_labels.shape}")
+        break
 
     # Model, loss functions, and optimizer
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -478,7 +577,7 @@ if __name__ == "__main__":
     # Train the model
     train_model(
         model, train_loader, val_loader, optimizer, device, param_means, param_stds,
-        epochs=50, checkpoint_dir=checkpoint_dir, log_file=log_file, alpha=1.0, beta=1.0, gamma=0.5, delta=0.5
+        epochs=50, checkpoint_dir=checkpoint_dir, log_file=log_file, alpha=1.0, beta=0.0, gamma=0.0, delta=0.0
     )
 
    

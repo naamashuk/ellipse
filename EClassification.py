@@ -9,6 +9,18 @@ from PIL import Image
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+import torch.nn.init as init
+
+
+def initialize_weights(module):
+    if isinstance(module, nn.Conv2d):
+        init.kaiming_normal_(module.weight, nonlinearity='relu')
+        if module.bias is not None:
+            init.constant_(module.bias, 0)
+    elif isinstance(module, nn.Linear):
+        init.xavier_normal_(module.weight)
+        if module.bias is not None:
+            init.constant_(module.bias, 0)
 
 
 # Dataset Definition
@@ -52,11 +64,12 @@ class EllipseClassifier(nn.Module):
     def __init__(self):
         super(EllipseClassifier, self).__init__()
         
-        self.conv1 = nn.Conv2d(3, 16, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1)
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(32, 32, kernel_size=3, padding=1)
         self.conv3 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.conv4 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
         self.pool = nn.MaxPool2d(2, 2)
-        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        self.global_pool = nn.AdaptiveMaxPool2d(1)
         self.fc1 = nn.Linear(64, 64)
         self.fc2 = nn.Linear(64, 1)
 
@@ -180,6 +193,7 @@ if __name__ == "__main__":
     # Model, loss, optimizer
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = EllipseClassifier().to(device)
+    model.apply(initialize_weights)
     criterion = nn.BCELoss()  # Binary Cross-Entropy Loss
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 
