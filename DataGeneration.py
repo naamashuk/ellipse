@@ -4,12 +4,32 @@ import os
 import random
 import json
 
-def generate_white_noise_image(width, height):
+def generate_white_noise_image(height=400, width=400, mean=0, std=1):
     """
-    Generate an image with white noise as the background.
+    Generates an RGB image with white noise.
+    
+    Parameters:
+        height (int): Height of the image.
+        width (int): Width of the image.
+        mean (float): Mean of the normal distribution.
+        std (float): Standard deviation of the normal distribution.
+
+    Returns:
+        np.ndarray: Generated white noise RGB image.
     """
-    noise = np.random.randint(0, 256, (height, width, 3), dtype=np.uint8)  # RGB noise
-    return noise
+    # Generate white noise for each channel
+    noise_r = np.random.normal(mean, std, (height, width))
+    noise_g = np.random.normal(mean, std, (height, width))
+    noise_b = np.random.normal(mean, std, (height, width))
+    
+    # Stack channels to create an RGB image
+    noise_rgb = np.stack((noise_r, noise_g, noise_b), axis=-1)
+    
+    # Normalize the values to 0-255 for visualization
+    noise_rgb_normalized = (noise_rgb - noise_rgb.min()) / (noise_rgb.max() - noise_rgb.min()) * 255
+    noise_rgb_normalized = noise_rgb_normalized.astype(np.uint8)
+    
+    return noise_rgb_normalized
 
 def generate_zeros_image(width, height):
     """
@@ -34,13 +54,13 @@ def add_filled_ellipse_to_image(image):
     """
     height, width, _ = image.shape
     center, axes, angle, color = generate_ellipse_parameters(width, height)
-    cv2.ellipse(image, (int(center[0]), int(center[1])), (int(axes[0]), int(axes[1])),
+    cv2.ellipse(image, (int(center[0]), int(center[1])), (int(np.max(axes)), int(np.min(axes))),
                 angle, 0, 360, color, thickness=2)  # Use thickness=-1 for a filled ellipse
     
     metadata = {
         "isEllipse": True,
-        "centerCoord": [center[0], center[1]],
-        "radLength": [axes[0], axes[1]],
+        "centerCoord": [int(center[0]), int(center[1])],
+        "radLength": [int(max(axes[0], axes[1])), int(min(axes[0], axes[1]))],
         "rotAngle": np.deg2rad(angle)  # Convert to radians
     }
     return image, metadata
@@ -75,7 +95,7 @@ def generate_dataset(output_dir, num_class_0, num_class_1, width, height):
 
     for _ in range(num_class_0):
         # Generate white noise image for class 0
-        noise_image = generate_zeros_image(width, height) #generate_white_noise_image(width, height)
+        noise_image = generate_white_noise_image() #generate_zeros_image(width, height) #
         metadata = generate_metadata_for_class_0()
 
         # Generate file names
@@ -91,10 +111,12 @@ def generate_dataset(output_dir, num_class_0, num_class_1, width, height):
 
     for _ in range(num_class_1):
         # Generate white noise image with a filled ellipse for class 1
-        noise_image = generate_zeros_image(width, height) #generate_white_noise_image(width, height)
+        noise_image = generate_white_noise_image() #generate_zeros_image(width, height) #
         ellipse_image, metadata = add_filled_ellipse_to_image(noise_image)
 
         # Generate file names
+        if metadata['radLength'][1] > metadata['radLength'][0]:
+            u=1
         base_filename = f"Image{image_counter:04d}"
         image_path = os.path.join(output_dir, f"{base_filename}.png")
         json_path = os.path.join(output_dir, f"{base_filename}.json")
@@ -108,7 +130,7 @@ def generate_dataset(output_dir, num_class_0, num_class_1, width, height):
     print(f"Dataset generated in {output_dir}")
 
 # Parameters
-output_dir = "ellipse_data_no_noise"  # Single folder for all images and JSON files
+output_dir = "ellipse_data2"  # Single folder for all images and JSON files
 num_class_0 = 500  # Number of Class 0 images (no ellipse)
 num_class_1 = 500  # Number of Class 1 images (with filled ellipse)
 width, height = 400, 400  # Image dimensions

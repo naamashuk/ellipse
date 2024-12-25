@@ -12,6 +12,70 @@ from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import csv
+import torch.nn.init as init
+import cv2
+import random
+from PIL import Image
+
+
+
+
+def generate_and_save_ellipse_comparison(image_size, gt_params, pred_params, save_dir, run_index, thickness=2, gt_color=(0, 255, 0), pred_color=(255, 0, 0)):
+    """
+    Generates an image with ground truth and predicted ellipses and saves it as a PNG file.
+    
+    Parameters:
+    - image_size: Tuple specifying the size of the image (height, width)
+    - gt_params: Ground truth parameters [x, y, a, b, theta]
+    - pred_params: Predicted parameters [x, y, a, b, theta]
+    - save_dir: Directory to save the PNG image
+    - run_index: Index to name the file
+    - thickness: Thickness of the ellipse contours (default: 2)
+    - gt_color: Color of the ground truth ellipse (default: green)
+    - pred_color: Color of the predicted ellipse (default: red)
+    
+    Returns:
+    - file_path: Path to the saved PNG image
+    """
+    
+
+    # Create a blank image
+    image = np.zeros((image_size[0], image_size[1], 3), dtype=np.uint8)
+    
+    # Ground truth ellipse
+    gt_center = (int(gt_params[0]), int(gt_params[1]))
+    gt_axes = (int(gt_params[2]), int(gt_params[3]))
+    gt_angle = np.degrees(gt_params[4])  # Convert radians to degrees
+    cv2.ellipse(image, gt_center, gt_axes, gt_angle, 0, 360, gt_color, thickness)
+    
+    # Predicted ellipse
+    pred_center = (int(pred_params[0]), int(pred_params[1]))
+    pred_axes = (int(pred_params[2]), int(pred_params[3]))
+    pred_angle = np.degrees(pred_params[4])  # Convert radians to degrees
+    cv2.ellipse(image, pred_center, pred_axes, pred_angle, 0, 360, pred_color, thickness)
+    
+    # Ensure the save directory exists
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Save the image
+    filename = f"ellipse_comparison_{run_index}.png"
+    file_path = os.path.join(save_dir, filename)
+    cv2.imwrite(file_path, image)
+    
+    #print(f"Image saved to: {file_path}")
+    return file_path
+
+
+
+def initialize_weights(module):
+    if isinstance(module, nn.Conv2d):
+        init.kaiming_normal_(module.weight, nonlinearity='relu')
+        if module.bias is not None:
+            init.constant_(module.bias, 0)
+    elif isinstance(module, nn.Linear):
+        init.xavier_normal_(module.weight)
+        if module.bias is not None:
+            init.constant_(module.bias, 0)
 
 def normalize_params(params, x_max, y_max, a_max, b_max, theta_max):
     """
@@ -72,6 +136,7 @@ class EllipseDataset(Dataset):
 
     def __getitem__(self, idx):
         image_name = self.image_list[idx]
+        #print(image_name,'--------------------------------------------------------------')
         image_path = os.path.join(self.image_dir, image_name)
         json_path = os.path.join(self.json_dir, image_name.replace(".png", ".json"))
 
@@ -90,6 +155,19 @@ class EllipseDataset(Dataset):
         # Combine and normalize parameters
         reg_params = np.array([center[0], center[1], radii[0], radii[1], theta])
         if label > 0.5:
+            
+            black_image = np.zeros((400,400,3), dtype=np.uint8)
+            point_color = (255,255,0)  # White color for binary image (grayscale)
+            point_radius = 2  # Radius of each point
+            thickness = -1  # Fill the points (circle)
+            
+            if(0):
+                cv2.ellipse(black_image, (center[0], center[1]), (radii[0], radii[1]), int(theta/(np.pi)*180), 0, 360, (255,0,0), 2)
+
+                # Save the image
+                output_path = 'debug/ellipse_from_points.png'  # Replace with your desired path
+                cv2.imwrite(output_path, black_image)
+
             reg_params = normalize_params(
                 reg_params,
                 x_max=self.param_max["x"],
@@ -102,7 +180,7 @@ class EllipseDataset(Dataset):
         if self.transform:
             image = self.transform(image)
 
-        return image, torch.tensor(label, dtype=torch.float32), torch.tensor(reg_params, dtype=torch.float32)
+        return image, torch.tensor(label, dtype=torch.float32), torch.tensor(reg_params, dtype=torch.float32),image_name
 
 
 def combined_loss(class_output, reg_output, labels, reg_labels, sampled_points, alpha=1.0, beta=1.0, gamma=0.5, delta=0.5):
@@ -115,9 +193,9 @@ def combined_loss(class_output, reg_output, labels, reg_labels, sampled_points, 
 
     # Regression loss (only for positive samples)
     mask = labels > 0.5
-    loss_reg = 0.0
-    penalty_geo = 0.0
-    penalty_shape = 0.0
+    loss_reg = torch.tensor(0.0)
+    penalty_geo = torch.tensor(0.0)
+    penalty_shape = torch.tensor(0.0)
 
     if mask.sum() > 0:
         # Subset for positive samples
@@ -154,55 +232,36 @@ class EllipseDetector(nn.Module):
     def __init__(self):
         super(EllipseDetector, self).__init__()
         
-        # Feature extractor with reduced parameters
-        self.backbone = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1),  # Input: (3, 400, 400)
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),  # Output: (16, 200, 200)
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(32, 32, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.conv4 = nn.Conv2d(64, 1, kernel_size=3, padding=1)
 
-            nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),  # Output: (32, 100, 100)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.global_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc1 = nn.Linear(64, 64)
+        self.fc2 = nn.Linear(64, 1)
 
-            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),  # Output: (64, 50, 50)
+        self.fc3 = nn.Linear(625,256)
 
-            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),  # Output: (128, 25, 25)
-        )
+        self.fc4 = nn.Linear(256,5)
         
-        # Global average pooling to reduce parameters
-        self.global_pool = nn.AdaptiveAvgPool2d(1)  # Output: (128, 1, 1)
-
-        # Classification head
-        self.class_head = nn.Sequential(
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),  # Output: binary classification (ellipse or no ellipse)
-            nn.Sigmoid()  # Output between 0 and 1
-        )
-
-        # Regression head
-        self.regression_head = nn.Sequential(
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 5)  # Outputs [x, y, a, b, theta]
-        )
 
     def forward(self, x):
-        # Shared feature extraction
-        features = self.backbone(x)
-        features = self.global_pool(features)  # Shape: (batch_size, 128, 1, 1)
-        features = features.view(features.size(0), -1)  # Flatten to (batch_size, 128)
+        x = self.pool(torch.relu(self.conv1(x)))
+        x = self.pool(torch.relu(self.conv2(x)))
+        x_features = self.pool(torch.relu(self.conv3(x)))
+        x_cl = self.global_pool(x_features).view(x_features.size(0), -1)
+        
+        x_cl = torch.relu(self.fc1(x_cl))
+        x_cl = torch.sigmoid(self.fc2(x_cl))
 
-        # Classification output
-        class_out = self.class_head(features)
+        # is ellipse
+        x_reg = torch.relu(self.pool(self.conv4(x_features)))
+        x_reg = torch.relu(self.fc3(x_reg.view(x_reg.size(0), -1)))
+        x_reg = torch.relu(self.fc4(x_reg))
 
-        # Regression output
-        reg_out = self.regression_head(features)
-        return class_out, reg_out
+        return x_cl, x_reg
 
 
 def sample_points_from_gt(gt_params, num_points=100):
@@ -224,10 +283,26 @@ def sample_points_from_gt(gt_params, num_points=100):
     x0, y0, a, b, theta = gt_params.T  # (batch_size)
 
     # Compute ellipse points
-    x = x0.unsqueeze(1) + a.unsqueeze(1) * torch.cos(angles) * torch.cos(theta).unsqueeze(1) - \
-        b.unsqueeze(1) * torch.sin(angles) * torch.sin(theta).unsqueeze(1)
-    y = y0.unsqueeze(1) + a.unsqueeze(1) * torch.cos(angles) * torch.sin(theta).unsqueeze(1) + \
-        b.unsqueeze(1) * torch.sin(angles) * torch.cos(theta).unsqueeze(1)
+    x = x0.unsqueeze(1) + a.unsqueeze(1) * torch.cos(angles) * torch.cos(theta*2*np.pi).unsqueeze(1) - \
+        b.unsqueeze(1) * torch.sin(angles) * torch.sin(theta*2*np.pi).unsqueeze(1)
+    y = y0.unsqueeze(1) + a.unsqueeze(1) * torch.cos(angles) * torch.sin(theta*2*np.pi).unsqueeze(1) + \
+        b.unsqueeze(1) * torch.sin(angles) * torch.cos(theta*2*np.pi).unsqueeze(1)
+    
+    #plot ellipse
+    if(0):
+        if x.sum() >0 and y.sum() > 0:
+            black_image = np.zeros((400,400,3), dtype=np.uint8)
+            point_color = (255,255,0)  # White color for binary image (grayscale)
+            point_radius = 2  # Radius of each point
+            thickness = -1  # Fill the points (circle)
+            for i in range(x.shape[1]):
+                cv2.circle(black_image, (int(x[0,i]*400), int(y[0,i]*400)), point_radius, point_color, thickness)
+            
+            cv2.ellipse(black_image, (int(x0*400),int(y0*400)), (int(a*400),int(b*400)), int(theta*2*np.pi/(np.pi)*180), 0, 360, (255,0,0), 2)
+
+            # Save the image
+            output_path = 'debug/ellipse_from_points.png'  # Replace with your desired path
+            cv2.imwrite(output_path, black_image)
 
     # Combine x and y into sampled points
     sampled_points = torch.stack((x, y), dim=-1)  # (batch_size, num_points, 2)
@@ -267,7 +342,7 @@ def train_model(
         train_loss_cls = 0.0
         train_loss_reg = 0.0
 
-        for images, labels, reg_labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
+        for images, labels, reg_labels, image_name in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
             images, labels, reg_labels = images.to(device), labels.to(device), reg_labels.to(device)
 
             # Generate sampled points for the batch
@@ -278,7 +353,7 @@ def train_model(
 
             # Combined loss
             loss, loss_cls, loss_reg, penalty_geo, penalty_shape = combined_loss(
-                class_output, reg_output, labels, reg_labels, sampled_points, alpha, beta, gamma, delta
+                class_output, reg_output, labels, reg_labels, sampled_points, alpha, beta, gamma, delta*int(epoch>8)
             )
 
             # Backward pass and optimization
@@ -354,7 +429,7 @@ def evaluate_model(model, val_loader, criterion_cls, criterion_reg, device, para
     count_ratios = 0
 
     with torch.no_grad():
-        for images, labels, reg_labels in val_loader:
+        for images, labels, reg_labels, image_name in val_loader:
             images, labels, reg_labels = images.to(device), labels.to(device), reg_labels.to(device)
 
             # Forward pass
@@ -373,8 +448,29 @@ def evaluate_model(model, val_loader, criterion_cls, criterion_reg, device, para
                 # Reverse normalization
                 pred_params = reg_output[mask].cpu().numpy()
                 gt_params = reg_labels[mask].cpu().numpy()
-                pred_params_orig = pred_params * param_stds + param_means
-                gt_params_orig = gt_params * param_stds + param_means
+                pred_params_orig = pred_params * [400,400,400,400,2*np.pi]
+                gt_params_orig = gt_params * [400,400,400,400,2*np.pi]
+
+                # Example usage
+                # image_size = (400, 400)
+                # gt_params = [200, 200, 100, 50, np.pi / 4]  # Ground truth parameters
+                # pred_params = [200, 200, 90, 60, np.pi / 3]  # Predicted parameters
+                save_dir = "./ellipse_images"
+                # run_index = 1
+
+                param_max = {
+                "x": 400,  # Image width
+                "y": 400,  # Image height
+                "a": 400,  # Max semi-major axis
+                "b": 400,  # Max semi-minor axis
+                "theta": 2 * np.pi  # Theta max value
+                }
+
+                list_length = 10
+                random_index = random.randint(0, list_length - 1)
+                # Call the function
+                for ii in range(gt_params_orig.shape[0]):
+                    generate_and_save_ellipse_comparison((400,400), gt_params_orig[ii], pred_params_orig[ii], save_dir, ii)
 
                 # Compute ratios
                 for i, key in enumerate(["x", "y", "a", "b", "theta"]):
@@ -480,11 +576,50 @@ def reverse_standardization(pred_params, param_means, param_stds):
     return (pred_params * param_stds) + param_means
 
 
+
+def calculate_dataset_mean_std(image_dir):
+    """
+    Calculate the mean and standard deviation of a dataset of images.
+    Assumes images are in the specified directory, and converts pixel values to the range [0, 1].
+    
+    Parameters:
+    - image_dir: Directory containing the training set images.
+    
+    Returns:
+    - mean: Mean of pixel values across all images.
+    - std: Standard deviation of pixel values across all images.
+    """
+    pixel_values = []
+    
+    # Iterate over all images in the directory
+    for filename in os.listdir(image_dir):
+        if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff')):
+            # Load the image
+            image_path = os.path.join(image_dir, filename)
+            image = Image.open(image_path)#.convert('RGB')  # Ensure RGB format
+            image_array = np.array(image, dtype=np.float32) / 255.0  # Normalize to [0, 1]
+            
+            # Flatten and append pixel values
+            pixel_values.append(np.mean(image_array.reshape(-1, 3)))  # Flatten per channel
+    
+    # Stack all pixel values and calculate mean and std
+    all_pixels = np.vstack(pixel_values)  # Combine all pixel data
+    mean = np.mean(all_pixels, axis=0)  # Mean per channel
+    std = np.std(all_pixels, axis=0)    # Std per channel
+    
+    return mean, std
+
+
+
+
+
  # Main Script
 if __name__ == "__main__":
     # Dataset paths
-    data_dir = "ellipse_data"
-    json_dir = "ellipse_data"
+    data_dir = "ellipse_data2"
+    json_dir = "ellipse_data2"
+
+    mean, std = calculate_dataset_mean_std(data_dir)
 
     # List of all image files
     image_list = [f for f in os.listdir(data_dir) if f.endswith(".png")]
@@ -511,19 +646,19 @@ if __name__ == "__main__":
 
     # Define transformations
     transform = transforms.Compose([
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomRotation(15),
+        #transforms.RandomHorizontalFlip(),
+        #transforms.RandomRotation(15),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])  # Example image normalization
+        transforms.Normalize(mean=[mean[0], mean[0], mean[0]], std=[std[0], std[0], std[0]])  # Example image normalization
     ])
 
     # Define max values based on your data
     param_max = {
         "x": 400,  # Image width
         "y": 400,  # Image height
-        "a": 283,  # Max semi-major axis
-        "b": 200,  # Max semi-minor axis
-        "theta": np.pi  # Theta max value
+        "a": 400,  # Max semi-major axis
+        "b": 400,  # Max semi-minor axis
+        "theta": 2 * np.pi  # Theta max value
     }
 
     # Create datasets
@@ -544,7 +679,7 @@ if __name__ == "__main__":
     # print(f"Number of negative samples (no ellipse): {negative_count}")
 
     for idx in range(5):  # Test first 5 samples
-        image, label, reg_params = train_dataset[idx]
+        image, label, reg_params, image_name = train_dataset[idx]
         print(f"Sample {idx}: reg_params shape = {reg_params.shape}, label = {label}")
 
 
@@ -552,7 +687,7 @@ if __name__ == "__main__":
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
 
-    for images, labels, reg_labels in train_loader:
+    for images, labels, reg_labels, image_name in train_loader:
         print(f"Images shape: {images.shape}")
         print(f"Labels shape: {labels.shape}")
         print(f"Regression labels shape: {reg_labels.shape}")
@@ -561,6 +696,8 @@ if __name__ == "__main__":
     # Model, loss functions, and optimizer
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = EllipseDetector()
+    model.apply(initialize_weights)
+
     # Count parameters
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total number of trainable parameters: {num_params}")
@@ -571,13 +708,13 @@ if __name__ == "__main__":
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 
     # Checkpoints and logging
-    checkpoint_dir = "checkpoints2"
-    log_file = "training_log2.csv"
+    checkpoint_dir = "checkpoints_24_12_24"
+    log_file = "training_log_24_12_24.csv"
 
     # Train the model
     train_model(
         model, train_loader, val_loader, optimizer, device, param_means, param_stds,
-        epochs=50, checkpoint_dir=checkpoint_dir, log_file=log_file, alpha=1.0, beta=0.0, gamma=0.0, delta=0.0
+        epochs=450, checkpoint_dir=checkpoint_dir, log_file=log_file, alpha=1.0, beta=2, gamma=20, delta=3
     )
 
    
