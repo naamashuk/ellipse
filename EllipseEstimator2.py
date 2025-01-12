@@ -16,6 +16,7 @@ import torch.nn.init as init
 import cv2
 import random
 from PIL import Image
+from draw_ellipse import draw_points_on_image
 
 
 
@@ -69,7 +70,8 @@ def generate_and_save_ellipse_comparison(image_size, gt_params, pred_params, sav
 
 def initialize_weights(module):
     if isinstance(module, nn.Conv2d):
-        init.kaiming_normal_(module.weight, nonlinearity='relu')
+        init.xavier_uniform_(module.weight)
+        #init.kaiming_normal_(module.weight, nonlinearity='relu')
         if module.bias is not None:
             init.constant_(module.bias, 0)
     elif isinstance(module, nn.Linear):
@@ -141,13 +143,14 @@ class EllipseDataset(Dataset):
         json_path = os.path.join(self.json_dir, image_name.replace(".png", ".json"))
 
         # Load image
-        image = Image.open(image_path).convert("RGB")
+        image = Image.open(image_path)
 
         # Load parameters
         with open(json_path, "r") as f:
             metadata = json.load(f)
 
         label = 1.0 if metadata["isEllipse"] else 0.0
+        
         center = metadata["centerCoord"]
         radii = metadata["radLength"]
         theta = metadata["rotAngle"]
@@ -165,7 +168,7 @@ class EllipseDataset(Dataset):
                 cv2.ellipse(black_image, (center[0], center[1]), (radii[0], radii[1]), int(theta/(np.pi)*180), 0, 360, (255,0,0), 2)
 
                 # Save the image
-                output_path = 'debug/ellipse_from_points.png'  # Replace with your desired path
+                output_path = image_path.replace('.', '_debug.')  # Replace with your desired path
                 cv2.imwrite(output_path, black_image)
 
             reg_params = normalize_params(
@@ -248,9 +251,10 @@ class EllipseDetector(nn.Module):
         
 
     def forward(self, x):
-        x = self.pool(torch.relu(self.conv1(x)))
-        x = self.pool(torch.relu(self.conv2(x)))
-        x_features = self.pool(torch.relu(self.conv3(x)))
+        x1 = self.pool(torch.relu(self.conv1(x)))
+        x1 = self.pool(torch.relu(self.conv2(x1)))
+
+        x_features = self.pool(torch.relu(self.conv3(x1)))
         x_cl = self.global_pool(x_features).view(x_features.size(0), -1)
         
         x_cl = torch.relu(self.fc1(x_cl))
@@ -348,7 +352,16 @@ def train_model(
             # Generate sampled points for the batch
             sampled_points = sample_points_from_gt(reg_labels, num_points=100)
 
+
+            # fig, ax = plt.subplots(1,1, num=3)
+            # ax.plot(sampled_points.numpy().squeeze()[:,0]*400, -400*sampled_points.numpy().squeeze()[:,1], '.')
+            # ax.set_xlim(0, 400)
+            # ax.set_ylim(-400, 0)
+            # fig.savefig('./debug' + '/' + image_name[0])
+
             # Forward pass
+            if labels[0] == 0:
+                continue
             class_output, reg_output = model(images)
 
             # Combined loss
@@ -590,7 +603,8 @@ def calculate_dataset_mean_std(image_dir):
     - std: Standard deviation of pixel values across all images.
     """
     pixel_values = []
-    
+    lmean = []
+    lstd = []
     # Iterate over all images in the directory
     for filename in os.listdir(image_dir):
         if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff')):
@@ -600,12 +614,13 @@ def calculate_dataset_mean_std(image_dir):
             image_array = np.array(image, dtype=np.float32) / 255.0  # Normalize to [0, 1]
             
             # Flatten and append pixel values
-            pixel_values.append(np.mean(image_array.reshape(-1, 3)))  # Flatten per channel
-    
+            lmean.append(image_array.reshape(-1, 3).mean())  # Flatten per channel
+            lstd.append(image_array.reshape(-1, 3).std())
+
     # Stack all pixel values and calculate mean and std
-    all_pixels = np.vstack(pixel_values)  # Combine all pixel data
-    mean = np.mean(all_pixels, axis=0)  # Mean per channel
-    std = np.std(all_pixels, axis=0)    # Std per channel
+    # all_pixels = np.vstack(pixel_values)  # Combine all pixel data
+    mean = np.mean(lmean, axis=0)  # Mean per channel
+    std = np.mean(lstd, axis=0)    # Std per channel
     
     return mean, std
 
@@ -619,7 +634,9 @@ if __name__ == "__main__":
     data_dir = "ellipse_data2"
     json_dir = "ellipse_data2"
 
-    mean, std = calculate_dataset_mean_std(data_dir)
+    #mean, std = calculate_dataset_mean_std(data_dir)
+    mean = [0.497, 0.497]
+    std = [0.11, 0.11] # wrong remove
 
     # List of all image files
     image_list = [f for f in os.listdir(data_dir) if f.endswith(".png")]
@@ -684,8 +701,8 @@ if __name__ == "__main__":
 
 
     # DataLoaders
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False)
 
     for images, labels, reg_labels, image_name in train_loader:
         print(f"Images shape: {images.shape}")
@@ -714,7 +731,7 @@ if __name__ == "__main__":
     # Train the model
     train_model(
         model, train_loader, val_loader, optimizer, device, param_means, param_stds,
-        epochs=450, checkpoint_dir=checkpoint_dir, log_file=log_file, alpha=1.0, beta=2, gamma=20, delta=3
+        epochs=450, checkpoint_dir=checkpoint_dir, log_file=log_file, alpha=1.0, beta=2, gamma=1, delta=3
     )
 
    
